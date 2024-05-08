@@ -1,6 +1,6 @@
 (* main.sml
  *
- * COPYRIGHT (c) 2024 John Reppy (http://cs.uchicago.edu/~jhr)
+ * COPYRIGHT (c) 2024 John Reppy (https://cs.uchicago.edu/~jhr)
  * All rights reserved.
  *
  * Sample code
@@ -48,6 +48,8 @@ structure Main : sig
     val dumpAST = dumpIf "typed AST" DumpAST.dumpToFile Options.dumpAST
     val dumpSimple = dumpIf "simple AST"
           (DumpSimpleAST.dumpToFile "smpl") Options.dumpSimple
+    val dumpBadSimple = dumpIf "bogus simple AST"
+          (DumpSimpleAST.dumpToFile "err") (ref true)
     val dumpOpt = dumpIf "simple AST after optimization"
           (DumpSimpleAST.dumpToFile "opt") Options.dumpOpt
     val dumpFVS = dumpIf "free vars"
@@ -55,6 +57,17 @@ structure Main : sig
     val dumpClosure = dumpIf "simple AST after closure"
           (DumpSimpleAST.dumpToFile "clos") Options.dumpClosure
     end (* local *)
+
+    (* check IR invariants for SimpleAST *)
+    fun checkSimple (base, msg, chkCensus, prog) = if !Options.checkSimple
+          then (
+            say ["checking SimpleAST after ", msg, "\n"];
+            if CheckSimple.check (msg, chkCensus, prog)
+              then (
+                dumpBadSimple (base, prog);
+                raise Error.ERROR)
+              else ())
+          else ()
 
     (* process an input file that is known to exist *)
     fun doFile (errStrm, filename) = let
@@ -89,9 +102,7 @@ structure Main : sig
           (* output SimpleAST *)
           val _ = dumpSimple (base, simple)
           (* do a consistency check on the SimpleAST *)
-          val _ = if !Options.checkSimple andalso CheckSimple.check ("simplify", false, simple)
-		then raise Error.ERROR
-                else ()
+          val _ = checkSimple (base, "simplify", false, simple)
           (* conditionally optimize the Simple AST code *)
           val simple = let
                 val simple = if !Options.optimize
@@ -102,11 +113,8 @@ structure Main : sig
                         say ["let-floating ", filename, "\n"];
                         LetFloat.transform simple)
                 in
-                (* do a consistency check on the SimpleAST *)
-                  if !Options.checkSimple
-                  andalso CheckSimple.check ("optimization", !Options.optimize, simple)
-                    then raise Error.ERROR
-                    else ();
+                  (* do an optional consistency check on the SimpleAST *)
+                  checkSimple (base, "optimization", true, simple);
                   dumpOpt (base, simple);
                   simple
                 end

@@ -33,27 +33,40 @@ structure Contract : sig
     structure P = Prim
     structure V = SimpleVar
     structure DC = SimpleDataCon
+    structure VSet = SimpleVar.Set
     structure VMap = SimpleVar.Map
 
     (* interesting things that a variable might be bound to *)
     datatype bind
-      = Tuple of S.value list           (* bound to a SimpleAST tuple *)
-      | Value of S.value                (* bound to a SimpleAST value *)
-      | ConApp of DC.t * S.value list   (* bound to a data constructor application *)
-      | Func of S.var list * S.exp      (* bound to a single-use function *)
-      | Other                           (* other/unknown binding *)
+      = Tuple of S.value list                   (* bound to a SimpleAST tuple *)
+      | Value of S.value                        (* bound to a SimpleAST value *)
+      | ConApp of DC.t * S.value list           (* bound to a data constructor application *)
+      | Func of S.var * S.var list * S.exp      (* bound to a single-use function *)
+      | Other                                   (* other/unknown binding *)
 
     (* a mapping from variables to values *)
     type binding_env = bind VMap.map
 
+    type context = {
+        env : binding_env,
+        outerFns : VSet.set
+      }
+
+    val emptyCxt : context = {env = VMap.empty, outerFns = VSet.empty}
+
+    fun bindVar ({env, outerFns}, x, b) =
+          {env = VMap.insert(env, x, b), outerFns = outerFns}
+
+    fun insideFun ({env, outerFns}, f) = {env = env, outerFns = VSet.add(outerFns, f)}
+
     (* bind a variable to a value; if the value is a variable, then we adjust its
      * use count.
      *)
-    fun bindVarToVal (x, S.V_VAR y, env) = (
-        (* we are removing one use of y and replacing x with y everywhere *)
+    fun bindVarToVal (x, S.V_VAR y, cxt) = (
+          (* we are removing one use of y and replacing x with y everywhere *)
           V.addUse(y, V.useCntOf x - 1);
-          VMap.insert (env, x, Value(S.V_VAR y)))
-      | bindVarToVal (x, v, env) = VMap.insert (env, x, Value v)
+          bindVar (cxt, x, Value(S.V_VAR y)))
+      | bindVarToVal (x, v, cxt) = bindVar (cxt, x, Value v)
 
     fun bindVarsToVals ([], [], env) = env
       | bindVarsToVals (x::xs, v::vs, env) =
@@ -61,13 +74,13 @@ structure Contract : sig
       | bindVarsToVals _ = raise Fail "bindVarsToVals: arity mismatch"
 
     (* resolve a variable to its binding *)
-    fun resolveVar (env, x) = (case VMap.find (env, x)
+    fun resolveVar ({env, outerFns}, x) = (case VMap.find (env, x)
            of SOME v => v
             | NONE => Other
           (* end case *))
 
     (* resolve a value to its definition *)
-    fun resolveVal env (S.V_VAR x) = resolveVar (env, x)
+    fun resolveVal cxt (S.V_VAR x) = resolveVar (cxt, x)
       | resolveVal _ v = Value v
 
     (* decrement use counts for values *)
@@ -104,12 +117,12 @@ structure Contract : sig
     (* the result of contracting a RHS *)
     datatype result
       = RESULT of S.value               (* RHS reduced to a value *)
-      | RENAME of binding_env * S.rhs   (* updated binding environment plus renamed rhs *)
+      | RENAME of context * S.rhs       (* updated binding environment plus renamed rhs *)
 
     (* rename values by replacing variables with the value that
      * they are bound to (if any)
      *)
-    fun rn env (v as S.V_VAR x) = (case VMap.find(env, x)
+    fun rn {env, outerFns} (v as S.V_VAR x) = (case VMap.find(env, x)
              of SOME(Value v) => v
               | _ => v
             (* end case *))
@@ -121,21 +134,23 @@ structure Contract : sig
              of SOME(Value(S.V_VAR x')) => x'
               | _ => x
             (* end case *))
-      fun deleteWithSubst deleteFn (env, term) = deleteFn (mkSubst env, term)
+      fun deleteWithSubst deleteFn ({env, outerFns}, term) =
+            deleteFn ({subst = mkSubst env, outerFns = outerFns}, term)
     in
     val deleteRHS = deleteWithSubst C.deleteRHS
     val deleteExp = deleteWithSubst C.deleteExp
-    fun deleteRule env = C.deleteRule (mkSubst env)
+    fun deleteRule {env, outerFns} =
+          C.deleteRule {subst = mkSubst env, outerFns = outerFns}
     end
 
     (* constant folding for primitive operators *)
-    fun contractPrim (env, oper, args) = let
-          val args = List.map (rn env) args
+    fun contractPrim (cxt, oper, args) = let
+          val args = List.map (rn cxt) args
           fun result v = (
                 List.app decVal args;
                 RESULT v)
           (* return the renamed RHS when there is no contraction *)
-          fun rename () = RENAME(env, S.R_PRIM(oper, args))
+          fun rename () = RENAME(cxt, S.R_PRIM(oper, args))
           fun mkInt n = result(S.V_INT n)
           in
             case (oper, args)
@@ -146,12 +161,12 @@ structure Contract : sig
               | (P.IntMul, [S.V_INT a, S.V_INT b]) =>
                   mkInt (sNarrow (a * b))
               | (P.IntDiv, [S.V_INT _, S.V_INT 0]) =>
-                (* will cause a runtime error, so cannot contract *)
+                  (* will cause a runtime error, so cannot contract *)
                   rename ()
               | (P.IntDiv, [S.V_INT a, S.V_INT b]) =>
                   (mkInt (sNarrow (IntInf.quot(a, b))))
               | (P.IntMod, [S.V_INT _, S.V_INT 0]) =>
-                (* will cause a runtime error, so cannot contract *)
+                  (* will cause a runtime error, so cannot contract *)
                   rename ()
               | (P.IntMod, [S.V_INT a, S.V_INT b]) =>
                   mkInt (sNarrow (IntInf.rem(a, b)))
@@ -169,8 +184,8 @@ structure Contract : sig
           end
 
     (* constant folding for primitive conditional tests *)
-    fun contractCond (env, oper, args) = (
-          case (oper, List.map (rn env) args)
+    fun contractCond (cxt, oper, args) = (
+          case (oper, List.map (rn cxt) args)
            of (PrimCond.IntLt, [S.V_INT a, S.V_INT b]) => SOME(a < b)
             | (PrimCond.IntLte, [S.V_INT a, S.V_INT b]) => SOME(a <= b)
             | (PrimCond.IntEq, [S.V_INT a, S.V_INT b]) => SOME(a = b)
@@ -194,69 +209,69 @@ structure Contract : sig
                 change();
                 S.mkFUN(f, xs, body, S.mkLET(x, S.R_EXP e1, e2)))
             | mkLet (x, e1, e2) = S.mkLET(x, S.R_EXP e1, e2)
-          fun xformExp (env, S.E(ppt, e)) = (case e
-                 of S.E_LET(x, S.R_EXP e1, e2) => (case xformExp (env, e1)
+          fun xformExp (cxt, S.E(ppt, e)) = (case e
+                 of S.E_LET(x, S.R_EXP e1, e2) => (case xformExp (cxt, e1)
                        of S.E(_, S.E_RET v) => let
                           (* replace `x` with `v` *)
-                            val env = bindVarToVal (x, rn env v, env)
+                            val cxt = bindVarToVal (x, v, cxt)
                             in
                               change();
-                              xformExp (env, e2)
+                              xformExp (cxt, e2)
                             end
-                        | e1' => mkLet (x, e1', xformExp (env, e2))
+                        | e1' => mkLet (x, e1', xformExp (cxt, e2))
                       (* end case *))
                   | S.E_LET(x, rhs, e) => if (V.unused x andalso isPureRHS rhs)
                       then ( (* eliminate unused variable and its binding *)
                         change();
-                        deleteRHS (env, rhs);
-                        xformExp (env, e))
-                      else (case xformRHS(env, x, rhs)
+                        deleteRHS (cxt, rhs);
+                        xformExp (cxt, e))
+                      else (case xformRHS(cxt, x, rhs)
                          of RESULT v => (
                               change();
                               V.decUse x;
-                              xformExp (bindVarToVal(x, v, env), e))
-                          | RENAME(env', rhs') => S.mkLET(x, rhs', xformExp(env', e))
+                              xformExp (bindVarToVal(x, v, cxt), e))
+                          | RENAME(cxt', rhs') => S.mkLET(x, rhs', xformExp(cxt', e))
                         (* end case *))
                   | S.E_FUN(f, xs, body, e) =>
-(* FIXME: insideCount = useCount ==> dead code *)
-                      if (V.useCntOf f = 1) andalso (C.appCntOf f = 1)
-                        then let
-                        (* this function is a potential candidate for contractive inlining *)
-                          val e' = xformExp (VMap.insert(env, f, Func(xs, body)), e)
-                          in
-                            change();
-                            if V.unused f
-                              then e' (* function was inlined *)
-                              else (
-                              (* `f` was not inlined, but it must be self-recursive and it
-                               * is never called, so we can delete it.
-                               *)
-                                deleteExp (env, body);
-                                e')
-                          end
-                        else xformFB (env, f, xs, body, e)
+                      if (C.insideCntOf f = V.useCntOf f)
+                        then (
+                          (* the function is not referenced outside its body *)
+                          deleteExp (cxt, body);
+                          xformExp (cxt, e))
+                      else if (V.useCntOf f = 1) andalso (C.appCntOf f = 1)
+                        then (
+                          change();
+                          (* sanity check *)
+                          if C.insideCntOf f > 0
+                            then raise Fail "bad census counts for function"
+                            else ();
+                          (* this function can be contracted by inlining *)
+                          xformExp (
+                            bindVar (insideFun (cxt, f), f, Func(f, xs, body)),
+                            e))
+                        else xformFB (cxt, f, xs, body, e)
                   | S.E_APPLY(f, vs) => let
-                      val vs' = List.map (rn env) vs
+                      val vs' = List.map (rn cxt) vs
                       in
-                        case resolveVar(env, f)
-                         of Func(xs, body) => let
-                            (* `f` is only applied here so we inline expand it *)
-                              val env' = ListPair.foldl bindVarToVal env (xs, vs')
+                        case resolveVar(cxt, f)
+                         of Func(f, xs, body) => let
+                              (* `f` is only applied here so we inline expand it *)
+                              val cxt' = ListPair.foldl bindVarToVal cxt (xs, vs')
                               in
                                 C.decApp f; V.decUse f;
-                                xformExp (env', body)
+                                xformExp (cxt', body)
                               end
                           | Value(S.V_VAR f') => S.mkAPPLY(f', vs')
                           | _ => S.mkAPPLY(f, vs')
                         (* end case *)
                       end
                   | S.E_IF(tst, vs, e1, e2) => let
-                      val vs' = List.map (rn env) vs
+                      val vs' = List.map (rn cxt) vs
                       in
-                        case contractCond (env, tst, vs')
-                         of SOME true => (deleteExp (env, e2); xformExp(env, e1))
-                          | SOME false => (deleteExp (env, e1); xformExp(env, e2))
-                          | NONE => S.mkIF(tst, vs', xformExp(env, e1), xformExp(env, e2))
+                        case contractCond (cxt, tst, vs')
+                         of SOME true => (deleteExp (cxt, e2); xformExp(cxt, e1))
+                          | SOME false => (deleteExp (cxt, e1); xformExp(cxt, e2))
+                          | NONE => S.mkIF(tst, vs', xformExp(cxt, e1), xformExp(cxt, e2))
                         (* end case *)
                       end
                   | S.E_CASE(v, rules) => let
@@ -265,7 +280,7 @@ structure Contract : sig
                      *)
                       fun mkCase arg = S.E(ppt, S.E_CASE arg)
                     (* contract the action of a rule *)
-                      fun xformRule (p, e) = (p, xformExp(env, e))
+                      fun xformRule (p, e) = (p, xformExp(cxt, e))
                     (* reduce a case when we know the argument is the data constructor `dc` *)
                       fun reduce (dc, rules) = let
                           (* return true if a case rule matches the constructor `dc` *)
@@ -276,16 +291,16 @@ structure Contract : sig
                             in
                               case List.partition match rules
                                of ([rule], others) => (
-                                    List.app (deleteRule env) others;
+                                    List.app (deleteRule cxt) others;
                                     rule)
                                 | ([rule, dflt], others) => (
-                                    deleteRule env dflt;
-                                    List.app (deleteRule env) others;
+                                    deleteRule cxt dflt;
+                                    List.app (deleteRule cxt) others;
                                     rule)
                                 | _ => raise Fail "impossible: bogus case"
                               (* end case *)
                             end
-                      val bind = resolveVal env v
+                      val bind = resolveVal cxt v
                       in
                       (* if the case argment is a constructor, then we can resolve
                        * the case at compile time.
@@ -295,7 +310,7 @@ structure Contract : sig
                               change();
                               decVal v;
                               case reduce (dc, rules)
-                               of (S.P_VAR x, e) => xformExp(VMap.insert(env, x, bind), e)
+                               of (S.P_VAR x, e) => xformExp(bindVar(cxt, x, bind), e)
                                 | _ => raise Match (* compiler bug *)
                               (* end case *))
                           | ConApp(dc, vs') => (
@@ -303,59 +318,59 @@ structure Contract : sig
                               decVal v;
                               case reduce (dc, rules)
                                of (S.P_DCON(_, xs), e) =>
-                                    xformExp(bindVarsToVals(xs, vs', env), e)
+                                    xformExp(bindVarsToVals(xs, vs', cxt), e)
                                 | (S.P_VAR x, e) =>
-                                    xformExp(VMap.insert(env, x, bind), e)
+                                    xformExp(bindVar(cxt, x, bind), e)
                               (* end case *))
                           | Value v' => mkCase(v', List.map xformRule rules)
                           | _ => mkCase(v, List.map xformRule rules)
                         (* end case *)
                       end
-                  | S.E_RET v => S.mkRET(rn env v)
+                  | S.E_RET v => S.mkRET(rn cxt v)
                 (* end case *))
-          and xformRHS (env, lhs, rhs) = (case rhs
+          and xformRHS (cxt, lhs, rhs) = (case rhs
                  of S.R_EXP e => raise Fail "impossible"
-                  | S.R_PRIM(p, vs) => contractPrim(env, p, List.map (rn env) vs)
-                  | S.R_CALL(cf, vs) => RENAME(env, S.R_CALL(cf, List.map (rn env) vs))
+                  | S.R_PRIM(p, vs) => contractPrim(cxt, p, List.map (rn cxt) vs)
+                  | S.R_CALL(cf, vs) => RENAME(cxt, S.R_CALL(cf, List.map (rn cxt) vs))
                   | S.R_TUPLE vs => let
-                      val vs' = List.map (rn env) vs
+                      val vs' = List.map (rn cxt) vs
                       in
-                        RENAME(VMap.insert(env, lhs, Tuple vs'), S.R_TUPLE vs')
+                        RENAME(bindVar(cxt, lhs, Tuple vs'), S.R_TUPLE vs')
                       end
-                  | S.R_SELECT(i, x) => (case resolveVar(env, x)
+                  | S.R_SELECT(i, x) => (case resolveVar(cxt, x)
                        of Tuple vs => (change(); V.decUse x; RESULT(List.nth(vs, i)))
-                        | Value(S.V_VAR x') => RENAME(env, S.R_SELECT(i, x'))
-                        | Other => RENAME(env, rhs)
+                        | Value(S.V_VAR x') => RENAME(cxt, S.R_SELECT(i, x'))
+                        | Other => RENAME(cxt, rhs)
                         | _ => raise Fail "bogus binding"
                       (* end case *))
                   | S.R_DCON(dc, vs) => let
-                      val vs' = List.map (rn env) vs
+                      val vs' = List.map (rn cxt) vs
                       in
-                        RENAME(VMap.insert(env, lhs, ConApp(dc, vs')), S.R_DCON(dc, vs'))
+                        RENAME(bindVar(cxt, lhs, ConApp(dc, vs')), S.R_DCON(dc, vs'))
                       end
                 (* end case *))
           (* contraction for function bindinds when there is no inlining *)
-          and xformFB (env, f, params, body, e) = let
+          and xformFB (cxt, f, params, body, e) = let
                 fun chkUnused () = if V.unused f
                       then (
                         change();
-                        deleteExp (env, body);
+                        deleteExp (cxt, body);
                         true)
                       else false
                 in
                   if chkUnused()
-                    then xformExp (env, e)
+                    then xformExp (cxt, e)
                     else let
-                      val e' = xformExp (env, e)
+                      val e' = xformExp (cxt, e)
                       in
                         if chkUnused()
                           then e'
-                          else S.mkFUN(f, params, xformExp(env, body), e')
+                          else S.mkFUN(f, params, xformExp(cxt, body), e')
                       end
                 end
           (* iterate the contraction to a fixed point *)
           fun iterate e = let
-                val e' = xformExp (VMap.empty, e)
+                val e' = xformExp (emptyCxt, e)
                 in
                   if !anyChange
                     then (anyChange := false; iterate e')

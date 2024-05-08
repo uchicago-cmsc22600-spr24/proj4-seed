@@ -449,9 +449,10 @@ structure Simplify : sig
           end (* translate *)
 
     fun translate prog = let
-          val prog = NormalizeAST.transform prog
+          val simple = simplify (NormalizeAST.transform prog)
           in
-            simplify prog
+            Census.init simple;
+            simple
           end
 
   end

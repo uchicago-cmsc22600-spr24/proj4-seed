@@ -11,9 +11,9 @@
 
 structure SimpleOpt : sig
 
-  (* `transform say prog` performs the optimization passes on the program.
-   * The function `say` is used to report progress.
-   *)
+    (* `transform say prog` performs the optimization passes on the program.
+     * The function `say` is used to report progress.
+     *)
      val transform : (string list -> unit) -> SimpleAST.program -> SimpleAST.program
 
   end = struct
@@ -21,15 +21,10 @@ structure SimpleOpt : sig
   (* list of passes *)
     val passes = [
             ("let-float", LetFloat.transform),
-(* [EXTRA CREDIT]
-            ("contract", Contract.transform),
-            ("uncurry", Uncurry.transform),
-*)
             ("contract", Contract.transform)
           ]
 
     fun transform say prog = let
-          val _ = Census.init prog
           fun apply ((name, transform), prog) = (
                 say [name, "\n"];
                 transform prog)

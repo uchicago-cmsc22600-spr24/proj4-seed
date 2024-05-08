@@ -85,12 +85,12 @@ structure CheckSimple : sig
                   then error (cxt, ["multiple bindings for '", V.toString x, "'"])
                   else isBound := Set.add(!isBound, x);
                 Set.add(bnd, x))
-          (* shadow census counts *)
+          (* shadow use counts *)
           val useCnt : int ref Tbl.hash_table = Tbl.mkTable(64, Fail "use table")
           val getUseCntr = getCntr useCnt
           fun incUseCnt x = let val cntr = getUseCntr x in cntr := !cntr + 1 end
-          (* check that the computed census count matches the count we computed walking the
-           * scope of the variable.
+          (* check that the computed use count matches the count
+           * we computed walking the scope of the variable.
            *)
           fun chkUseCnt cxt x = if chkCensus andalso V.useCntOf x <> !(getUseCntr x)
                 then err (cxt, [
@@ -98,10 +98,24 @@ structure CheckSimple : sig
                     Int.toString(V.useCntOf x), "; expected ", Int.toString(!(getUseCntr x))
                   ])
                 else ()
+          (* shadow application counts *)
+          val appCnt : int ref Tbl.hash_table = Tbl.mkTable(64, Fail "app table")
+          val getAppCntr = getCntr appCnt
+          fun incAppCnt f = let val cntr = getAppCntr f in cntr := !cntr + 1 end
+          (* check that the computed application count matches the count
+           * we computed walking the scope of the function.
+           *)
+          fun chkAppCnt cxt f = if chkCensus andalso Census.appCntOf f <> !(getAppCntr f)
+                then err (cxt, [
+                    "`", V.toString f, "` has incorrect application count ",
+                    Int.toString(Census.appCntOf f), "; expected ",
+                    Int.toString(!(getUseCntr f))
+                  ])
+                else ()
           (* check that a variable use occurs in its scope and bump the use counter *)
           fun chkVarUse (bnd, cxt) x = (
                   if not (Set.member(bnd, x))
-                    then error (cxt, ["unbound use occurrence of `", V.toString x, "`"])
+                    then err (cxt, ["unbound use occurrence of `", V.toString x, "`"])
                     else ();
                   incUseCnt x)
           fun chkValue (bnd, cxt) (S.V_VAR x) = chkVarUse (bnd, cxt) x
@@ -124,11 +138,13 @@ structure CheckSimple : sig
                         chkExp (bnd'', body);
                         List.app (chkUseCnt cxt) xs;
                         chkExp (bnd', e);
-                        chkUseCnt "fun binding" f
+                        chkUseCnt cxt f;
+                        chkAppCnt cxt f
                       end
                   | S.E_APPLY(f, vs) => (
                       chkVarUse (bnd, appCxt (f, vs)) f;
-                      chkValues (bnd, appCxt (f, vs), vs))
+                      chkValues (bnd, appCxt (f, vs), vs);
+                      incAppCnt f)
                   | S.E_IF(tst, vs, e1, e2) => (
                       if PrimCond.arityOf tst <> length vs
                         then err(ifCxt (tst, vs), ["arity mismatch"])

@@ -36,13 +36,20 @@ structure Census : sig
     val decApp : SimpleVar.t -> unit            (* decrement count by one *)
     val appCntOf : SimpleVar.t -> int           (* return the variable's application count *)
 
-    (* a variable to variable substitution for renaming variables before deleting them *)
-    type subst = SimpleVar.t -> SimpleVar.t
+    (* context information for deleting a sub-term in the Simple AST *)
+    type context = {
+        subst : SimpleVar.t -> SimpleVar.t,     (* a variable to variable substitution
+                                                 * for renaming variables
+                                                 *)
+        outerFns : SimpleVar.Set.set            (* the set of outer functions containing
+                                                 * the thing being deleted.
+                                                 *)
+      }
 
     (* Decrement the counts of the variables that are used in the various terms *)
-    val deleteExp : subst * SimpleAST.exp -> unit
-    val deleteRHS : subst * SimpleAST.rhs -> unit
-    val deleteRule : subst -> SimpleAST.pat * SimpleAST.exp -> unit
+    val deleteExp : context * SimpleAST.exp -> unit
+    val deleteRHS : context * SimpleAST.rhs -> unit
+    val deleteRule : context -> SimpleAST.pat * SimpleAST.exp -> unit
 
   end = struct
 
@@ -119,7 +126,7 @@ structure Census : sig
                             List.app (fn (p, e) => (clrPat p; doExp' e)) rules)
                         | S.E_RET v => incVal v
                       (* end case *))
-                and doRHS funs rhs = (case rhs
+                and doRHS rhs = (case rhs
                        of S.R_EXP e => doExp' e
                         | S.R_PRIM(_, vs) => incVals vs
                         | S.R_CALL(_, vs) => incVals vs
@@ -134,16 +141,29 @@ structure Census : sig
             doExp (VSet.empty, e)
           end
 
-(* TODO: need set of functions to maintain inside counts *)
-    type subst = SimpleVar.t -> SimpleVar.t
+    type context = {
+        subst : SimpleVar.t -> SimpleVar.t,
+        outerFns : SimpleVar.Set.set
+      }
 
     (* decrement the use count of a value *)
-    fun decVar (subst, x) = V.decUse (subst x)
-    fun decVal (subst, S.V_VAR x) = decVar (subst, x)
+    fun decFunApp ({subst, outerFns}, f) = let
+          val f' = subst f
+          in
+            if V.Set.member(outerFns, f') then decInside f' else ();
+            V.decUse f'; decApp f'
+          end
+    fun decVar ({subst, outerFns}, x) = let
+          val x' = subst x
+          in
+            if V.Set.member(outerFns, x') then decInside x' else ();
+            V.decUse x'
+          end
+    fun decVal (cxt, S.V_VAR x) = decVar (cxt, x)
       | decVal _ = ()
-    fun decVals (subst, vs) = List.app (fn v => decVal(subst, v)) vs
+    fun decVals (cxt, vs) = List.app (fn v => decVal(cxt, v)) vs
 
-    fun deleteExp (subst, e) = let
+    fun deleteExp (cxt, e) = let
           fun del (S.E(_, e)) = (case e
                  of S.E_LET(_, rhs, e) => (
                       delRHS rhs;
@@ -151,39 +171,36 @@ structure Census : sig
                   | S.E_FUN(f, xs, body, e) => (
                       del body;
                       del e)
-                  | S.E_APPLY(f, vs) => let
-                      val f = subst f
-                      in
-                        V.decUse f; decApp f; decVals (subst, vs)
-                      end
-                  | S.E_IF(_, vs, e1, e2) => (decVals (subst, vs); del e1; del e2)
+                  | S.E_APPLY(f, vs) => (
+                      decFunApp (cxt, f); decVals (cxt, vs))
+                  | S.E_IF(_, vs, e1, e2) => (decVals (cxt, vs); del e1; del e2)
                   | S.E_CASE(v, rules) => (
-                      decVal (subst, v);
+                      decVal (cxt, v);
                       List.app delRule rules)
-                  | S.E_RET v => decVal (subst, v)
+                  | S.E_RET v => decVal (cxt, v)
                 (* end case *))
           and delRHS rhs = (case rhs
                  of S.R_EXP e => del e
-                  | S.R_PRIM(_, vs) => decVals (subst, vs)
-                  | S.R_CALL(_, vs) => decVals (subst, vs)
-                  | S.R_TUPLE vs => decVals (subst, vs)
-                  | S.R_SELECT(_, x) => decVar (subst, x)
-                  | S.R_DCON(_, vs) => decVals (subst, vs)
+                  | S.R_PRIM(_, vs) => decVals (cxt, vs)
+                  | S.R_CALL(_, vs) => decVals (cxt, vs)
+                  | S.R_TUPLE vs => decVals (cxt, vs)
+                  | S.R_SELECT(_, x) => decVar (cxt, x)
+                  | S.R_DCON(_, vs) => decVals (cxt, vs)
                 (* end case *))
           and delRule (_, exp) = del exp
           in
             del e
           end
 
-    fun deleteRHS (subst, rhs) = (case rhs
-           of S.R_EXP e => deleteExp (subst, e)
-            | S.R_PRIM(_, vs) => decVals (subst, vs)
-            | S.R_CALL(_, vs) => decVals (subst, vs)
-            | S.R_TUPLE vs => decVals (subst, vs)
-            | S.R_SELECT(_, x) => decVar (subst, x)
-            | S.R_DCON(_, vs) => decVals (subst, vs)
+    fun deleteRHS (cxt, rhs) = (case rhs
+           of S.R_EXP e => deleteExp (cxt, e)
+            | S.R_PRIM(_, vs) => decVals (cxt, vs)
+            | S.R_CALL(_, vs) => decVals (cxt, vs)
+            | S.R_TUPLE vs => decVals (cxt, vs)
+            | S.R_SELECT(_, x) => decVar (cxt, x)
+            | S.R_DCON(_, vs) => decVals (cxt, vs)
           (* end case *))
 
-    fun deleteRule subst (_, exp) = deleteExp (subst, exp)
+    fun deleteRule cxt (_, exp) = deleteExp (cxt, exp)
 
   end
